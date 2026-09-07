@@ -1192,11 +1192,43 @@ class MasterHandler(BaseHTTPRequestHandler):
         if not allowed:
             self._json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "không có quyền dừng job này"}); return
         now = _now()
+        marked_uncheckable = self._finalize_unresolved_accounts(job_id, now)
         self.server.store.batch([
-            {"sql": "UPDATE jobs SET status='stopped', finished_at=? WHERE id=? AND status='open'", "args": [now, job_id]},
-            {"sql": "UPDATE chunks SET status='stopped', lease_until=NULL WHERE job_id=? AND status IN ('pending','claimed')", "args": [job_id]},
+            {"sql": "UPDATE chunks SET status='done', lease_until=NULL, reported_at=? WHERE job_id=? AND status IN ('pending','claimed')", "args": [now, job_id]},
+            {"sql": "UPDATE jobs SET status='done', finished_at=? WHERE id=? AND status='open'", "args": [now, job_id]},
         ])
-        self._json(HTTPStatus.OK, {"ok": True, "job_id": job_id, "status": "stopped"})
+        self._json(HTTPStatus.OK, {"ok": True, "job_id": job_id, "status": "done", "marked_uncheckable": marked_uncheckable})
+
+    def _finalize_unresolved_accounts(self, job_id: int, now: float) -> int:
+        store = self.server.store
+        statements: list[dict[str, Any]] = []
+        marked = 0
+        for chunk_id, account_data in store.fetch("SELECT id, account FROM chunks WHERE job_id=? AND status IN ('pending','claimed')", (job_id,)):
+            try:
+                credentials = json.loads(account_data)
+            except (TypeError, json.JSONDecodeError):
+                credentials = []
+            if not isinstance(credentials, list):
+                continue
+            completed_indexes: set[int] = set()
+            for (row_json,) in store.fetch("SELECT row_json FROM results WHERE chunk_id=?", (chunk_id,)):
+                try:
+                    row = json.loads(row_json)
+                    completed_indexes.add(int(str(row.get("stt") or "0")) - 1)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            for index, credential in enumerate(credentials):
+                if index in completed_indexes:
+                    continue
+                account = str(credential).split("|", 1)[0].split(":", 1)[0].strip()
+                if not account:
+                    continue
+                row = {"stt": str(index + 1), "account": account, "status": "CHƯA THỂ CHECK", "result_type": "Chưa thể check", "uid": "", "name": "", "level": "", "player_status": "", "elapsed_ms": "0"}
+                statements.append({"sql": "INSERT INTO results (chunk_id, job_id, account, row_json, reported_at) VALUES (?,?,?,?,?) ON CONFLICT(chunk_id, account) DO UPDATE SET row_json=excluded.row_json, reported_at=excluded.reported_at", "args": [chunk_id, job_id, account, json.dumps(row, ensure_ascii=False), now]})
+                marked += 1
+        if statements:
+            store.batch(statements)
+        return marked
 
     def _handle_claim(self) -> None:
         try:
@@ -1298,7 +1330,7 @@ class MasterHandler(BaseHTTPRequestHandler):
             return
         job_id = chunk[0]
         job_state = store.fetchone("SELECT status FROM jobs WHERE id=?", (job_id,))
-        if job_state and job_state[0] == "stopped":
+        if job_state and job_state[0] != "open":
             self._json(HTTPStatus.OK, {"ok": True, "chunk_id": chunk_id, "stopped": True})
             return
         # Lấy số acc kỳ vọng của pack (kể cả pack nhỏ < chunk_size)
