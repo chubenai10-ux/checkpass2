@@ -1370,7 +1370,7 @@ REQUIRED_ACCOUNT_LABEL = "hồ sơ tài khoản"
 REQUIRED_SESSION_LABEL = "session_key"
 REQUIRED_KIENTUONG_LABEL = "Kiện Tướng"
 
-MAX_EMPTY_ATTEMPTS = 8
+BATCH_MAX_ATTEMPTS = 8
 BATCH_ROW_DEADLINE_SECONDS = 90.0
 BATCH_MAX_REQUEST_TIMEOUT = 8.0
 
@@ -1487,8 +1487,6 @@ def batch_check_one(
     retry_stopped = False
     login_rejected = False
     gave_up_reason = ""
-    has_partial = False
-    empty_reads = 0
     missing: list[str] = []
     effective_timeout = min(float(timeout), BATCH_MAX_REQUEST_TIMEOUT)
     while True:
@@ -1500,8 +1498,6 @@ def batch_check_one(
             )
         except Exception as exc:
             attempt_error = (str(exc).strip() or type(exc).__name__)[:220]
-            if not has_partial:
-                empty_reads += 1
         else:
             result = current_result
             attempt_error = ""
@@ -1515,22 +1511,12 @@ def batch_check_one(
                 break
             if not missing:
                 break
-            if len(missing) < 3:
-                has_partial = True
-                empty_reads = 0
-            elif not has_partial:
-                empty_reads += 1
-        if not has_partial:
-            if empty_reads >= MAX_EMPTY_ATTEMPTS:
-                gave_up_reason = (
-                    f"{MAX_EMPTY_ATTEMPTS} lần thử đều không đọc được dữ liệu nào"
-                )
-                break
-            if time.monotonic() - started >= BATCH_ROW_DEADLINE_SECONDS:
-                gave_up_reason = (
-                    f"quá {BATCH_ROW_DEADLINE_SECONDS:.0f}s không đọc được dữ liệu nào"
-                )
-                break
+        if attempt_count >= BATCH_MAX_ATTEMPTS:
+            gave_up_reason = f"quá {BATCH_MAX_ATTEMPTS} lần thử nhưng chưa đọc đủ dữ liệu yêu cầu"
+            break
+        if time.monotonic() - started >= BATCH_ROW_DEADLINE_SECONDS:
+            gave_up_reason = f"quá {BATCH_ROW_DEADLINE_SECONDS:.0f}s nhưng chưa đọc đủ dữ liệu yêu cầu"
+            break
         backoff = min(1.5 * attempt_count, 8.0)
         # FAIL nhanh (< 500ms) thường là rate limit/connection - đợi lâu hơn
         elapsed_so_far = time.monotonic() - started
@@ -1541,6 +1527,8 @@ def batch_check_one(
             break
 
     if result is None:
+        row["status"] = "CHƯA THỂ CHECK"
+        row["result_type"] = "Chưa thể check"
         row["error"] = attempt_error or (
             "đã dừng trước lần kiểm tra lại" if retry_stopped else "không có kết quả kiểm tra"
         )
@@ -1672,8 +1660,7 @@ def batch_check_one(
             errors.append("đã dừng trước lần kiểm tra lại")
         # Dung pass (co UID) thi khong bao gio FAIL - chi sai pass moi FAIL
         tcp_ok = bool(tcp_info.get("ok"))
-        succeeded = tcp_ok
-        row["status"] = "OK" if succeeded else "FAIL"
+        row["status"] = "OK" if tcp_ok else "CHƯA THỂ CHECK"
         if login_rejected:
             errors.insert(
                 0,
@@ -1681,13 +1668,14 @@ def batch_check_one(
             )
             row["status"] = "FAIL"
             row["result_type"] = "Sai pass"
-        elif gave_up_reason and not tcp_ok:
+        elif gave_up_reason:
             errors.insert(
                 0,
                 gave_up_reason
-                + " — nghi sai pass hoặc tài khoản có vấn đề, xin tự kiểm tra",
+                + " — chưa thể kết luận tài khoản/mật khẩu",
             )
-            row["status"] = "FAIL"
+            row["status"] = "CHƯA THỂ CHECK"
+            row["result_type"] = "Chưa thể check"
         elif missing:
             reportable_missing = [
                 item
@@ -1700,8 +1688,9 @@ def batch_check_one(
                     + ", ".join(reportable_missing)
                     + f" (sau {attempt_count} lần thử)"
                 )
-            if not tcp_info.get("ok") and reportable_missing:
-                row["status"] = "FAIL"
+            if reportable_missing and (not tcp_info.get("ok") or retry_stopped):
+                row["status"] = "CHƯA THỂ CHECK"
+                row["result_type"] = "Chưa thể check"
         elif retry_stopped and row["status"] == "OK":
             errors.append(f"dừng sớm sau khi đủ dữ liệu, đã kiểm tra {attempt_count} lần")
         if row["status"] == "FAIL":
@@ -1749,7 +1738,7 @@ def run_batch_core(
             try:
                 row = future.result()
             except Exception:
-                row = {"stt": "-", "account": "-", "status": "FAIL"}
+                row = {"stt": "-", "account": "-", "status": "CHƯA THỂ CHECK", "result_type": "Chưa thể check"}
             rows.append(row)
             done = len(rows)
             if done % 50 == 0 or done == total:
@@ -1795,7 +1784,7 @@ def _batch_worker(
         traceback.print_exc()
         with server.batch_lock:
             server.batch_rows.append({
-                "stt": "-", "account": "-", "status": "FAIL", "uid": "", "name": "",
+                "stt": "-", "account": "-", "status": "CHƯA THỂ CHECK", "result_type": "Chưa thể check", "uid": "", "name": "",
                 "level": "", "session_key": "", "elapsed_ms": "",
             })
     finally:
