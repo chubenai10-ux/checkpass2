@@ -30,6 +30,8 @@ from typing import Any
 DEFAULT_CHUNK_LIMIT = 15
 # Chunk được cố định để tránh client thay đổi kích thước qua API.
 MAX_CHUNK_LIMIT = 15
+DEFAULT_MAX_ACCOUNTS_PER_JOB = 1_000
+MAX_CONFIGURED_ACCOUNTS_PER_JOB = 1_000_000
 DEFAULT_DB_PATH = Path(__file__).resolve().with_name("master.db")
 DEFAULT_LEASE_MINUTES = 60
 MAX_ACCOUNT_RETRY_ROUNDS = 3
@@ -73,6 +75,10 @@ CREATE TABLE IF NOT EXISTS results (
     row_json TEXT NOT NULL,
     reported_at REAL NOT NULL,
     UNIQUE(chunk_id, account)
+);
+CREATE TABLE IF NOT EXISTS app_settings (
+    setting_key TEXT PRIMARY KEY,
+    setting_value TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_claim ON chunks(status, lease_until);
 CREATE INDEX IF NOT EXISTS idx_chunks_job ON chunks(job_id);
@@ -532,8 +538,6 @@ def parse_accounts(text: str) -> list[ParsedAccount]:
         if not account or not password or len(account) > 128 or len(password) > 1024:
             raise ValueError(f"Dòng {line_number}: tài khoản/mật khẩu không hợp lệ")
         result.append(ParsedAccount(account, password))
-        if len(result) >= MAX_CHUNK_LIMIT * 10000:
-            raise ValueError("Quá nhiều tài khoản trong một lần gửi")
     if not result:
         raise ValueError("Danh sách trống hoặc không có dòng hợp lệ")
     return result
@@ -541,6 +545,25 @@ def parse_accounts(text: str) -> list[ParsedAccount]:
 
 def split_chunks(accounts: list[ParsedAccount], chunk_size: int) -> list[list[ParsedAccount]]:
     return [accounts[i : i + chunk_size] for i in range(0, len(accounts), chunk_size)]
+
+
+def _max_accounts_per_job(store: Any) -> int:
+    row = store.fetchone("SELECT setting_value FROM app_settings WHERE setting_key=?", ("max_accounts_per_job",))
+    try:
+        value = int(row[0]) if row and row[0] is not None else DEFAULT_MAX_ACCOUNTS_PER_JOB
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_ACCOUNTS_PER_JOB
+    return value if 1 <= value <= MAX_CONFIGURED_ACCOUNTS_PER_JOB else DEFAULT_MAX_ACCOUNTS_PER_JOB
+
+
+def _save_max_accounts_per_job(store: Any, value: int) -> None:
+    store.batch([{
+        "sql": (
+            "INSERT INTO app_settings (setting_key, setting_value) VALUES (?,?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value"
+        ),
+        "args": ["max_accounts_per_job", str(value)],
+    }])
 
 
 _PAGE_HTML = """
@@ -609,9 +632,19 @@ tr:hover{background:#1c2128}
   <div id="keyStatus" style="margin-top:10px;font-size:13px"></div>
 </div>
 
+<div class="card" id="accountLimitCard" style="display:none;border-color:#d29922">
+  <h2>⚙️ Giới hạn tài khoản/job</h2>
+  <p style="color:#8b949e;font-size:13px;margin-bottom:10px">Chỉ áp dụng cho license key thường; Master Token không bị giới hạn.</p>
+  <div class="row">
+    <div class="field"><label>Số tài khoản tối đa/job</label><input type="number" id="maxAccountsPerJob" min="1" max="1000000" step="1"></div>
+    <div class="field"><label>&nbsp;</label><button class="btn btn-primary" onclick="saveAccountLimit()">💾 Lưu giới hạn</button></div>
+  </div>
+</div>
+
 <div class="card">
   <h2>📋 Gửi danh sách tài khoản</h2>
-  <textarea id="accInput" placeholder="Nhập tài khoản, mỗi dòng 1 acc&#10;Định dạng: user|pass  hoặc  user:pass&#10;&#10;Ví dụ:&#10;account1|password1&#10;account2|password2"></textarea>
+  <textarea id="accInput" oninput="updateAccountCounter()" placeholder="Nhập tài khoản, mỗi dòng 1 acc&#10;Định dạng: user|pass  hoặc  user:pass&#10;&#10;Ví dụ:&#10;account1|password1&#10;account2|password2"></textarea>
+  <div id="accCounter" style="color:#8b949e;font-size:12px;margin-top:6px">0 tài khoản</div>
   <div class="row" style="margin-top:12px">
     <div class="field"><label>&nbsp;</label><button class="btn btn-primary" id="btnSend" onclick="sendJob()">🚀 Gửi check</button></div>
   </div>
@@ -649,6 +682,8 @@ function getHeaders(){return {'Authorization':'Bearer '+TOKEN,'Content-Type':'ap
 let H=getHeaders();
 let currentJobId=null;
 let detailPage=1;
+let isAdminKey=false;
+let maxAccountsPerJob=null;
 const DETAIL_PAGE_SIZE=50;
 
 function toast(msg,ms=3000){const t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(()=>t.style.display='none',ms)}
@@ -675,19 +710,24 @@ async function checkKey(){
   try{
     const r=await fetch('/api/verify?token='+encodeURIComponent(TOKEN),{headers:getHeaders()});
     const j=await r.json();
-    if(j.valid||j.ok){st.innerHTML='<span style="color:#56d364">✅ Key hợp lệ ('+previewKey(TOKEN)+')</span>';}
-    else{st.innerHTML='<span style="color:#ff7b72">❌ Key không hợp lệ: '+(j.error||'unknown')+'</span>';}
+    if(j.valid||j.ok){isAdminKey=j.is_admin===true;const value=Number(j.max_accounts_per_job);maxAccountsPerJob=Number.isInteger(value)&&value>0?value:null;document.getElementById('accountLimitCard').style.display=isAdminKey?'block':'none';if(maxAccountsPerJob)document.getElementById('maxAccountsPerJob').value=maxAccountsPerJob;updateAccountCounter();st.innerHTML='<span style="color:#56d364">✅ Key hợp lệ ('+previewKey(TOKEN)+')'+(isAdminKey?' · Admin · Không giới hạn tài khoản/job':(maxAccountsPerJob?' · Tối đa '+maxAccountsPerJob.toLocaleString('vi-VN')+' tài khoản/job':''))+'</span>';}
+    else{isAdminKey=false;maxAccountsPerJob=null;document.getElementById('accountLimitCard').style.display='none';updateAccountCounter();st.innerHTML='<span style="color:#ff7b72">❌ Key không hợp lệ: '+(j.error||'unknown')+'</span>';}
   }catch(e){st.innerHTML='<span style="color:#d29922">⚠️ Không kiểm tra được: '+e.message+'</span>';}
 }
 updateOwnerBadge();checkKey();
 
+function submittedAccountCount(){return(document.getElementById('accInput').value||'').split(/\r?\n/).filter(line=>{const value=line.trim();return value&&!value.startsWith('#')}).length;}
+function updateAccountCounter(){const count=submittedAccountCount(),el=document.getElementById('accCounter'),limited=!isAdminKey&&Number.isInteger(maxAccountsPerJob);el.textContent=count.toLocaleString('vi-VN')+(limited?' / '+maxAccountsPerJob.toLocaleString('vi-VN'):'')+' tài khoản';el.style.color=limited&&count>maxAccountsPerJob?'#ff7b72':'#8b949e';}
+async function saveAccountLimit(){const value=Number(document.getElementById('maxAccountsPerJob').value);if(!Number.isInteger(value)||value<1||value>1000000){toast('Giới hạn phải là số nguyên từ 1 đến 1.000.000');return;}const data=await api('/api/admin/settings',{method:'POST',body:JSON.stringify({max_accounts_per_job:value})});if(data.ok){maxAccountsPerJob=value;updateAccountCounter();toast('✅ Đã lưu giới hạn '+value.toLocaleString('vi-VN')+' tài khoản/job')}else toast('❌ '+data.error);}
+
 async function sendJob(){
   const text=document.getElementById('accInput').value.trim();
   if(!text){toast('Nhập danh sách tài khoản!');return}
+  if(!isAdminKey&&Number.isInteger(maxAccountsPerJob)&&submittedAccountCount()>maxAccountsPerJob){toast('❌ Mỗi job chỉ được gửi tối đa '+maxAccountsPerJob.toLocaleString('vi-VN')+' tài khoản');return}
   const btn=document.getElementById('btnSend');btn.disabled=true;btn.textContent='⏳ Đang gửi...';
   try{
     const d=await api('/api/jobs',{method:'POST',body:JSON.stringify({text})});
-    if(d.ok){toast('✅ Tạo Job #'+d.job_id+' ('+d.total+' acc)');document.getElementById('accInput').value='';loadJobs();viewJob(d.job_id)}
+    if(d.ok){toast('✅ Tạo Job #'+d.job_id+' ('+d.total+' acc)');document.getElementById('accInput').value='';updateAccountCounter();loadJobs();viewJob(d.job_id)}
     else toast('❌ '+d.error)
   }catch(e){toast('❌ Lỗi: '+e.message)}finally{btn.disabled=false;btn.textContent='🚀 Gửi check'}
 }
@@ -864,6 +904,14 @@ class MasterHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "token vệ tinh không hợp lệ (MASTER_TOKEN không khớp)"})
         return None
 
+    def _require_admin(self) -> dict[str, Any] | None:
+        master_token = (self.server.master_token or "").strip()
+        auth = self._get_auth_info()
+        if not master_token or not auth.get("is_admin"):
+            self._json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "chỉ MASTER_TOKEN mới được thay đổi cấu hình"})
+            return None
+        return auth
+
     def _security_headers(self, content_type: str) -> None:
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store, max-age=0")
@@ -947,17 +995,22 @@ class MasterHandler(BaseHTTPRequestHandler):
                 mt = self.server.master_token or ""
                 is_master = bool(mt and tok and secrets.compare_digest(tok.strip(), mt.strip()))
                 if is_master:
-                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": True, "preview": _preview_key(tok), "info": {"mode": "master_token"}})
+                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": True, "preview": _preview_key(tok), "max_accounts_per_job": _max_accounts_per_job(self.server.store), "info": {"mode": "master_token"}})
                     return
                 ok, info = _verify_license_key(tok)
                 if ok:
-                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "preview": _preview_key(tok), "info": info})
+                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": False, "preview": _preview_key(tok), "max_accounts_per_job": _max_accounts_per_job(self.server.store), "info": info})
                 else:
                     self._json(HTTPStatus.OK, {"ok": False, "valid": False, "error": info.get("error") or "key không hợp lệ", "info": info,
                         "debug": {"token_len": len(tok), "master_token_len": len(mt), "token_preview": _preview_key(tok)}})
                 return
             if path == "/" or path == "/index.html":
                 self._html(_PAGE_HTML)
+                return
+            if path == "/api/admin/settings":
+                if self._require_admin() is None:
+                    return
+                self._handle_admin_settings_get()
                 return
             # Các API user cần xác thực license key (hoặc MASTER_TOKEN cho admin)
             auth = self._require_user()
@@ -1018,6 +1071,11 @@ class MasterHandler(BaseHTTPRequestHandler):
             # Dùng _clean_path để hỗ trợ cả /api/jobs?foo=bar
             path = self._clean_path()
             # Phân biệt endpoint user vs vệ tinh
+            if path == "/api/admin/settings":
+                if self._require_admin() is None:
+                    return
+                self._handle_admin_settings_save()
+                return
             if path == "/api/jobs":
                 auth = self._require_user()
                 if auth is None:
@@ -1065,11 +1123,11 @@ class MasterHandler(BaseHTTPRequestHandler):
                 mt = self.server.master_token or ""
                 is_master = bool(mt and tok and secrets.compare_digest(tok.strip(), mt.strip()))
                 if is_master:
-                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": True, "preview": _preview_key(tok), "info": {"mode": "master_token"}})
+                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": True, "preview": _preview_key(tok), "max_accounts_per_job": _max_accounts_per_job(self.server.store), "info": {"mode": "master_token"}})
                     return
                 ok, info = _verify_license_key(tok)
                 if ok:
-                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "preview": _preview_key(tok), "info": info})
+                    self._json(HTTPStatus.OK, {"ok": True, "valid": True, "is_admin": False, "preview": _preview_key(tok), "max_accounts_per_job": _max_accounts_per_job(self.server.store), "info": info})
                 else:
                     self._json(HTTPStatus.OK, {"ok": False, "valid": False, "error": info.get("error") or "key không hợp lệ", "info": info})
                 return
@@ -1083,6 +1141,32 @@ class MasterHandler(BaseHTTPRequestHandler):
                 pass
 
     # --- handlers -----------------------------------------------------
+
+    def _handle_admin_settings_get(self) -> None:
+        self._json(HTTPStatus.OK, {
+            "ok": True,
+            "max_accounts_per_job": _max_accounts_per_job(self.server.store),
+        })
+
+    def _handle_admin_settings_save(self) -> None:
+        try:
+            body = self._read_json()
+        except ValueError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            return
+        value = body.get("max_accounts_per_job") if isinstance(body, dict) else None
+        try:
+            if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+                raise ValueError
+            limit = int(value)
+        except (TypeError, ValueError):
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "giới hạn tài khoản/job phải là số nguyên"})
+            return
+        if not 1 <= limit <= MAX_CONFIGURED_ACCOUNTS_PER_JOB:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "giới hạn tài khoản/job phải từ 1 đến 1.000.000"})
+            return
+        _save_max_accounts_per_job(self.server.store, limit)
+        self._json(HTTPStatus.OK, {"ok": True, "max_accounts_per_job": limit})
 
     def _handle_jobs_list(self, auth: dict[str, Any] | None = None) -> None:
         store = self.server.store
@@ -1145,10 +1229,20 @@ class MasterHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             return
+        store = self.server.store
+        max_accounts_per_job = _max_accounts_per_job(store)
+        if not bool((auth or {}).get("is_admin")) and len(parsed) > max_accounts_per_job:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {
+                "ok": False,
+                "code": "ACCOUNT_LIMIT_REACHED",
+                "error": f"Mỗi job được gửi tối đa {max_accounts_per_job:,} tài khoản. Danh sách hiện có {len(parsed):,} tài khoản.",
+                "submitted_accounts": len(parsed),
+                "max_accounts_per_job": max_accounts_per_job,
+            })
+            return
         # Cố định 15 account/chunk; không nhận cấu hình từ client.
         chunk_size = DEFAULT_CHUNK_LIMIT
 
-        store = self.server.store
         owner_hash = (auth or {}).get("owner_hash", "") if auth else ""
         owner_preview = (auth or {}).get("owner_preview", "") if auth else ""
         try:
